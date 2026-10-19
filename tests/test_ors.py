@@ -24,3 +24,14 @@ def test_cuerpo_de_la_peticion(monkeypatch):
     assert op["vehicle_type"] == "hgv" and op["profile_params"]["restrictions"]["weight"] == 25.0
     assert op["avoid_polygons"] == poly
     assert r.duracion_min == 60 and r.distancia_km == 50
+
+
+def test_perfil_auto_no_envia_restricciones(monkeypatch):
+    capturado = {}
+    def falso_post(url, json, headers, timeout):
+        capturado.update(url=url, json=json)
+        return _Resp()
+    monkeypatch.setattr(ors.requests, "post", falso_post)
+    ors.MotorORS("CLAVE").ruta([[-79.0, -8.1], [-78.9, -8.2]], PERFILES["jaulero_c3"], None, "driving-car")
+    assert capturado["url"].endswith("/v2/directions/driving-car/geojson")
+    assert "options" not in capturado["json"]

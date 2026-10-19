@@ -26,10 +26,13 @@ class MotorORS:
             raise ErrorRuteo(f"ORS {r.status_code}: {msg}")
         return r.json()
 
-    def ruta(self, coords: list, perfil: PerfilVehiculo | None = None, evitar: dict | None = None) -> Ruta:
+    def ruta(self, coords: list, perfil: PerfilVehiculo | None = None, evitar: dict | None = None,
+             perfil_ors: str = "driving-hgv") -> Ruta:
+        """perfil_ors: "driving-hgv" (camión) o "driving-car" (auto). Las restricciones de
+        dimensiones solo se envían con camión y si se pasa un perfil de vehículo."""
         cuerpo = {"coordinates": coords, "instructions": False}
         opciones = {}
-        if perfil:
+        if perfil and perfil_ors == "driving-hgv":
             opciones["vehicle_type"] = "hgv"
             opciones["profile_params"] = {"restrictions": {
                 "height": perfil.alto_m, "width": perfil.ancho_m,
@@ -38,7 +41,7 @@ class MotorORS:
             opciones["avoid_polygons"] = evitar
         if opciones:
             cuerpo["options"] = opciones
-        datos = self._post("/v2/directions/driving-hgv/geojson", cuerpo)
+        datos = self._post(f"/v2/directions/{perfil_ors}/geojson", cuerpo)
         f = datos["features"][0]
         resumen = f["properties"].get("summary", {})
         return Ruta(duracion_min=resumen.get("duration", 0) / 60,

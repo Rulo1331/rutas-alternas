@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 import folium
 import streamlit as st
+from shapely.geometry import shape
 from streamlit_folium import st_folium
 
 from core import geometria as G
@@ -25,9 +26,11 @@ def motor() -> MotorORS:
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def calcular_ruta(coords: tuple, perfil_clave: str, evitar_json: str | None):
+def calcular_ruta(coords: tuple, perfil_clave: str | None, evitar_json: str | None,
+                  perfil_ors: str = "driving-hgv"):
     evitar = json.loads(evitar_json) if evitar_json else None
-    return motor().ruta([list(c) for c in coords], P.PERFILES[perfil_clave], evitar)
+    perfil = P.PERFILES[perfil_clave] if perfil_clave else None
+    return motor().ruta([list(c) for c in coords], perfil, evitar, perfil_ors)
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -131,7 +134,9 @@ with col_res:
             b_lon, b_lat = (snap[0], snap[1]) if snap else bloqueo
             poligono = G.poligono_bloqueo(b_lon, b_lat, radio)
             res = {"orig": orig.coords, "poligono": G.a_geojson(poligono), "via": snap[2] if snap else "",
-                   "t_orig": orig.duracion_min, "d_orig": orig.distancia_km}
+                   "t_orig": orig.duracion_min, "d_orig": orig.distancia_km,
+                   "extremos": (origen, destino), "perfil": perfil_clave}
+            ss.diagnostico = None
 
             if not G.ruta_cruza(orig.coords, poligono):
                 res["fuera_de_ruta"] = True
@@ -141,8 +146,10 @@ with col_res:
                     alt = calcular_ruta((origen, destino), perfil_clave, json.dumps(res["poligono"]))
                     if G.ruta_cruza(alt.coords, poligono):
                         alt = None
-                except ErrorRuteo:
+                        res["error_alt"] = "La única ruta que encontró el motor pasa por el bloqueo."
+                except ErrorRuteo as e:
                     alt = None
+                    res["error_alt"] = str(e)
                 rec = recomendar(orig.duracion_min, alt.duracion_min if alt else None, t_hasta,
                                  reapertura_min, carga, hora.hour)
                 res.update(rec=rec, t_hasta=t_hasta)
@@ -182,6 +189,41 @@ with col_res:
                 st.caption(f"Vía del bloqueo según el mapa: {r['via']}")
             for a in rec.avisos:
                 st.warning(a)
+            if r.get("error_alt"):
+                st.caption(f"Detalle del motor: {r['error_alt']}")
             if r.get("enlace"):
                 st.link_button("Abrir alterna en Google Maps", r["enlace"], use_container_width=True)
                 st.caption("Google recalcula entre puntos intermedios; verifica que siga la alterna.")
+
+            # ---------- Diagnóstico ----------
+            with st.expander("Diagnóstico: comparar variantes de la alterna"):
+                st.caption("Calcula la alterna con tres variantes para saber por qué no aparece. "
+                           "Usa hasta 3 consultas de la cuota diaria.")
+                if st.button("Ejecutar diagnóstico", use_container_width=True):
+                    poly = shape(r["poligono"])
+                    evitar_json = json.dumps(r["poligono"])
+                    filas = []
+                    variantes = [("Camión con dimensiones", r["perfil"], "driving-hgv"),
+                                 ("Camión sin dimensiones", None, "driving-hgv"),
+                                 ("Auto (similar a Google Maps)", None, "driving-car")]
+                    for nombre, pk, pors in variantes:
+                        try:
+                            rr = calcular_ruta(r["extremos"], pk, evitar_json, pors)
+                            evita = not G.ruta_cruza(rr.coords, poly)
+                            filas.append({"Variante": nombre,
+                                          "Resultado": "Encontró alterna" if evita else "Pasa por el bloqueo",
+                                          "Tiempo": fmt_min(rr.duracion_min),
+                                          "Distancia": f"{rr.distancia_km:.1f} km"})
+                        except ErrorRuteo as e:
+                            filas.append({"Variante": nombre, "Resultado": f"Sin ruta ({e})",
+                                          "Tiempo": "—", "Distancia": "—"})
+                    ss.diagnostico = filas
+                if ss.get("diagnostico"):
+                    st.dataframe(ss.diagnostico, hide_index=True, use_container_width=True)
+                    st.markdown(
+                        "- **Solo el auto encuentra alterna:** el camino existe, pero el mapa lo marca como no apto "
+                        "para camión o es una trocha. Confirmar con los choferes si de verdad pasa un camión.\n"
+                        "- **Camión sin dimensiones sí, con dimensiones no:** alguna vía de la alterna tiene "
+                        "límite de peso, altura o ancho en el mapa.\n"
+                        "- **Ninguna encuentra:** la vía falta o está desconectada en OpenStreetMap, o el radio "
+                        "del bloqueo también cubre el cruce de la alterna. Reduce el radio y vuelve a calcular.")
