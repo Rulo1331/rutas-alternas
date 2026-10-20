@@ -1,0 +1,5 @@
+# Nombre en la tabla de hidrología, nombre en OpenStreetMap
+# Úsalo cuando un río aparece como "No encontrado". Busca el río en openstreetmap.org,
+# haz clic sobre él y copia su nombre exacto. Quita el # de la línea para activarla.
+rio_tabla,nombre_osm
+# RÍO CHANCAY LAMBAYEQUE,Río Chancay
