@@ -1,6 +1,7 @@
 """Simulador de interrupciones · fase de validación (Streamlit Community Cloud)."""
 import json
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import folium
@@ -10,13 +11,17 @@ from streamlit_folium import st_folium
 
 from core import geometria as G
 from core import parametros as P
+from core import rios as R
 from core.decision import fmt_min, recomendar
+from data.hidrologia import ultimos_datos
 from engines.ors import ErrorRuteo, MotorORS
 
 st.set_page_config(page_title="Rutas alternas · Simulador", layout="wide")
 TZ = ZoneInfo("America/Lima")
 CENTRO = (-8.11, -79.03)  # Trujillo
 COLORES = {"DESVIAR": "#C2570C", "ESPERAR": "#1D5FB8", "CONTINUAR": "#0E7A5F", "SIN_ALTERNA": "#4A5866"}
+RUTA_RIOS = Path(__file__).parent / "datos" / "rios.geojson"
+TABLA_HIDRO = "appsheetgr.BD_Procesamiento.senamhi_hidrologia"
 
 
 # ---------- Motor y caché (cada consulta cuenta para la cuota diaria de ORS) ----------
@@ -36,6 +41,24 @@ def calcular_ruta(coords: tuple, perfil_clave: str | None, evitar_json: str | No
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def ajustar(lon: float, lat: float):
     return motor().ajustar_a_via(lon, lat)
+
+
+@st.cache_resource
+def cargar_rios() -> list:
+    """Trazado de ríos generado por la acción 'Actualizar ríos' (datos/rios.geojson)."""
+    if not RUTA_RIOS.exists():
+        return []
+    fc = json.loads(RUTA_RIOS.read_text(encoding="utf-8"))
+    return [dict(f, _geom=shape(f["geometry"])) for f in fc.get("features", [])]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def estado_rios():
+    """Nivel de alerta por río según el último dato de hidrología. None si no hay conexión."""
+    if "gcp_service_account" not in st.secrets:
+        return None
+    filas = ultimos_datos(dict(st.secrets["gcp_service_account"]), st.secrets.get("BQ_TABLA_HIDRO", TABLA_HIDRO))
+    return R.estado_por_rio(filas, datetime.now(TZ).replace(tzinfo=None))
 
 
 def redondear(p):
@@ -63,6 +86,7 @@ with st.sidebar:
                f"Sin dato: se usa {fmt_min(P.REAPERTURA_DESCONOCIDA_MIN)} (provisional).")
     hora = st.time_input("Hora del escenario", datetime.now(TZ).time().replace(second=0, microsecond=0))
     radio = st.slider("Radio del bloqueo (m)", 50, 500, P.RADIO_BLOQUEO_M, 25)
+    mostrar_todos = st.checkbox("Mostrar todos los ríos monitoreados", value=False)
     if st.button("Limpiar escenario", use_container_width=True):
         ss.puntos = {"origen": None, "destino": None, "bloqueo": None}
         ss.resultado = None
@@ -73,6 +97,31 @@ with st.sidebar:
 st.title("Simulador de interrupciones")
 st.caption("Fase de validación · rutas de OpenStreetMap calculadas con OpenRouteService")
 
+# ---------- Ríos: trazado, estado y cruces con las rutas ----------
+rios = cargar_rios()
+aviso_hidro = None
+try:
+    estados = estado_rios()
+    if estados is None:
+        aviso_hidro = "Sin conexión a la tabla de hidrología: los ríos se muestran sin estado de alerta."
+except Exception as e:  # la app sigue funcionando aunque BigQuery falle
+    estados, aviso_hidro = None, f"No se pudo leer la hidrología ({e.__class__.__name__}). Ríos sin estado."
+estados = estados or {}
+
+r = ss.resultado
+cruces_orig = R.cruces(r["orig"], rios) if r and r.get("orig") else []
+cruces_alt = R.cruces(r["alt"], rios) if r and r.get("alt") else []
+claves_cruzadas = {c["clave"] for c in cruces_orig + cruces_alt}
+
+
+def nivel_de(clave: str) -> str:
+    return estados.get(clave, {}).get("nivel", "sin_dato")
+
+
+def detalle_de(clave: str) -> str:
+    return "<br>".join(estados.get(clave, {}).get("detalle", [])) or "Sin estación con datos recientes"
+
+
 col_mapa, col_res = st.columns([3, 2], gap="large")
 
 # ---------- Mapa ----------
@@ -81,7 +130,15 @@ with col_mapa:
     clave_modo = {"Camión": "origen", "Destino": "destino", "Bloqueo": "bloqueo"}[modo]
 
     m = folium.Map(location=CENTRO, zoom_start=9, control_scale=True)
-    r = ss.resultado
+    for f in rios:
+        k = f["properties"]["clave"]
+        if not (mostrar_todos or k in claves_cruzadas):
+            continue
+        nivel = nivel_de(k)
+        folium.GeoJson({"type": "Feature", "geometry": f["geometry"], "properties": f["properties"]},
+                       style_function=lambda _, c=R.COLORES[nivel], w=(5 if k in claves_cruzadas else 2.5):
+                       {"color": c, "weight": w, "opacity": 0.85},
+                       tooltip=f"Río {f['properties']['rio']} · {R.ETIQUETAS[nivel]}").add_to(m)
     if r and r.get("orig"):
         folium.PolyLine([(y, x) for x, y in r["orig"]], color="#1D5FB8", weight=6, tooltip="Ruta habitual").add_to(m)
     if r and r.get("alt"):
@@ -93,6 +150,17 @@ with col_mapa:
         lon, lat = r["divergencia"][:2]
         folium.CircleMarker((lat, lon), radius=9, color="#15202B", fill=True, fill_color="#FFFFFF",
                             fill_opacity=1, tooltip="Punto de decisión").add_to(m)
+    vistos = set()
+    for c in cruces_orig + cruces_alt:
+        clave_punto = (round(c["lon"], 4), round(c["lat"], 4))
+        if clave_punto in vistos:
+            continue
+        vistos.add(clave_punto)
+        nivel = nivel_de(c["clave"])
+        folium.CircleMarker((c["lat"], c["lon"]), radius=8, color="#FFFFFF", weight=2, fill=True,
+                            fill_color=R.COLORES[nivel], fill_opacity=1,
+                            tooltip=folium.Tooltip(f"<b>Cruce río {c['rio']}</b> · {R.ETIQUETAS[nivel]}"
+                                                   f"<br>{detalle_de(c['clave'])}")).add_to(m)
     iconos = {"origen": ("Camión", "blue", "truck"), "destino": ("Destino", "black", "flag"),
               "bloqueo": ("Bloqueo", "red", "ban")}
     for k, p in ss.puntos.items():
@@ -116,6 +184,10 @@ with col_mapa:
 
 # ---------- Cálculo ----------
 with col_res:
+    if aviso_hidro:
+        st.caption(aviso_hidro)
+    if not rios:
+        st.caption("Aún no hay trazado de ríos: ejecuta la acción «Actualizar ríos» en GitHub.")
     faltan = [n for n, k in (("camión", "origen"), ("destino", "destino"), ("bloqueo", "bloqueo")) if not ss.puntos[k]]
     if faltan:
         st.info("Marca en el mapa: " + ", ".join(faltan) + ".")
@@ -189,6 +261,18 @@ with col_res:
                 st.caption(f"Vía del bloqueo según el mapa: {r['via']}")
             for a in rec.avisos:
                 st.warning(a)
+            # ---------- Ríos cruzados ----------
+            for titulo, lista in (("habitual", cruces_orig), ("alterna", cruces_alt)):
+                if not lista:
+                    continue
+                nombres = ", ".join(dict.fromkeys(f"{c['rio']} ({R.ETIQUETAS[nivel_de(c['clave'])].lower()})"
+                                                  for c in lista))
+                st.write(f"**Ríos que cruza la ruta {titulo}:** {nombres}")
+                for c in {c["clave"]: c for c in lista}.values():
+                    if nivel_de(c["clave"]) in ("naranja", "rojo"):
+                        st.warning(f"La ruta {titulo} cruza el río {c['rio']} en "
+                                   f"{R.ETIQUETAS[nivel_de(c['clave'])].lower()}. "
+                                   + detalle_de(c["clave"]).replace("<br>", " · "))
             if r.get("error_alt"):
                 st.caption(f"Detalle del motor: {r['error_alt']}")
             if r.get("enlace"):
