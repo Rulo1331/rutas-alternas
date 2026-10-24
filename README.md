@@ -31,3 +31,8 @@ Los resultados se guardan en caché 6 h para no repetir consultas.
 4. La cuenta de servicio necesita los roles *BigQuery Data Viewer* (sobre el dataset) y *BigQuery Job User* (proyecto).
 
 Vuelve a ejecutar la acción solo cuando se agreguen estaciones de ríos nuevos.
+
+## Rutas predefinidas
+1. En la consola de BigQuery ejecuta `sql/fen_7_rutas.sql` (crea la tabla y dos rutas de ejemplo).
+2. Para agregar rutas, repite el `INSERT` con tus coordenadas. La app las lee cada 10 minutos.
+3. Opcional: si la tabla tiene otro nombre, agrega `BQ_TABLA_RUTAS = "proyecto.dataset.tabla"` en los secretos.
