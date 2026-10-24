@@ -39,6 +39,22 @@ def nivel_alerta(valor, amarillo, naranja, rojo) -> str:
     return "normal"
 
 
+def porcentaje_umbral(valor, amarillo, naranja, rojo) -> str:
+    """Texto con el % del valor respecto al siguiente umbral que aún no alcanza
+    (o al umbral rojo si ya lo superó). Vacío si no hay umbrales."""
+    if valor is None:
+        return ""
+    umbrales = [(n, u) for n, u in (("amarillo", amarillo), ("naranja", naranja), ("rojo", rojo)) if u]
+    if not umbrales:
+        return ""
+    for nombre, u in umbrales:
+        if valor < u:
+            return f"{valor / u:.0%} del umbral {nombre}"
+    nombre, u = umbrales[-1]
+    return f"{valor / u:.0%} del umbral {nombre}"
+
+
+
 def estado_por_rio(filas: list, ahora, max_horas: float = 24) -> dict:
     """Agrupa el último dato de cada estación/variable por río y toma el nivel MÁS GRAVE.
     filas: dicts con rio, departamento, estacion, variable, unidad, fecha_hora, valor y umbrales.
@@ -53,7 +69,10 @@ def estado_por_rio(filas: list, ahora, max_horas: float = 24) -> dict:
         else:
             nivel = nivel_alerta(valor, f.get("umbral_amarillo"), f.get("umbral_naranja"), f.get("umbral_rojo"))
         nombre = f.get("estacion") or f.get("cod_estacion") or "Estación"
-        dato = f"{valor:g} {f.get('unidad') or ''}".strip() if valor is not None else "sin valor"
+        dato = f"{round(valor, 2):g} {f.get('unidad') or ''}".strip() if valor is not None else "sin valor"
+        pct = porcentaje_umbral(valor, f.get("umbral_amarillo"), f.get("umbral_naranja"), f.get("umbral_rojo"))
+        if pct:
+            dato += f" ({pct})"
         cuando = f"{fh:%d/%m %H:%M}" if fh else "sin fecha"
         e = estados.setdefault(clave, {"nivel": "sin_dato", "detalle": []})
         if ORDEN[nivel] > ORDEN[e["nivel"]]:
