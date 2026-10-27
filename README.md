@@ -36,3 +36,8 @@ Vuelve a ejecutar la acción solo cuando se agreguen estaciones de ríos nuevos.
 1. En la consola de BigQuery ejecuta `sql/fen_7_rutas.sql` (crea la tabla y dos rutas de ejemplo).
 2. Para agregar rutas, repite el `INSERT` con tus coordenadas. La app las lee cada 10 minutos.
 3. Opcional: si la tabla tiene otro nombre, agrega `BQ_TABLA_RUTAS = "proyecto.dataset.tabla"` en los secretos.
+
+## Prueba comparativa ORS vs. HERE
+- Requiere `HERE_API_KEY` en los secretos. `HERE_LIMITE_DIARIO` (opcional, 100 por defecto) limita las consultas nuevas por día.
+- Botón «Comparar con HERE» en el panel de resultados: 3 consultas (habitual, alterna rápida, alterna sin caminos de tierra).
+- Las consultas repetidas salen de la caché y no consumen. La tabla se puede descargar en CSV para documentar la validación.

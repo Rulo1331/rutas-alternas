@@ -1,4 +1,6 @@
 """Simulador de interrupciones · fase de validación (Streamlit Community Cloud)."""
+import csv
+import io
 import json
 import uuid
 from datetime import datetime
@@ -20,6 +22,7 @@ from core.decision import fmt_min, recomendar_varios
 from core.modelos import Ruta
 from data.hidrologia import ultimos_datos
 from data.rutas import rutas_activas
+from engines.here import MotorHERE
 from engines.ors import ErrorRuteo, MotorORS
 
 st.set_page_config(page_title="Rutas alternas · Simulador", layout="wide")
@@ -49,6 +52,88 @@ def calcular_ruta(coords: tuple, perfil_clave: str | None, evitar_json: str | No
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def ajustar(lon: float, lat: float):
     return motor().ajustar_a_via(lon, lat)
+
+
+@st.cache_resource
+def contador_here() -> dict:
+    """Consultas a HERE hechas hoy (se reinicia cada día o si la app se reinicia)."""
+    return {"fecha": None, "n": 0}
+
+
+def limite_here() -> int:
+    return int(st.secrets.get("HERE_LIMITE_DIARIO", 100))
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def ruta_here(coords: tuple, perfil_clave: str, cajas: tuple, evitar_tierra: bool):
+    """Consulta a HERE. Solo las consultas nuevas (no las que vienen de la caché) cuentan para el límite."""
+    c = contador_here()
+    hoy = datetime.now(TZ).date()
+    if c["fecha"] != hoy:
+        c.update(fecha=hoy, n=0)
+    if c["n"] >= limite_here():
+        raise ErrorRuteo(f"Se alcanzó el límite diario de {limite_here()} consultas a HERE configurado en la app.")
+    c["n"] += 1
+    return MotorHERE(st.secrets["HERE_API_KEY"]).ruta([list(x) for x in coords], P.PERFILES[perfil_clave],
+                                                     list(cajas), evitar_tierra)
+
+
+def comparar_con_here(base: dict) -> list:
+    """Ruta habitual y dos alternas de HERE (rápida y evitando caminos de tierra) para el mismo escenario."""
+    union = shape(base["poligonos"])
+    partes = list(union.geoms) if hasattr(union, "geoms") else [union]
+    cajas = tuple(tuple(round(v, 6) for v in g.bounds) for g in partes)
+    perfil = P.PERFILES[base["perfil"]]
+    filas, lineas = [], []
+    try:
+        hab = ruta_here(tuple(map(tuple, base["coords"])), base["perfil"], (), False)
+    except ErrorRuteo as e:
+        return [{"Variante": "HERE · ruta habitual", "Resultado": str(e)}], []
+    cands = base.get("candidatas") or []
+    alterna_ors = cands[min(ss.get("cand_sel", 0), len(cands) - 1)]["alt"] if cands else None
+    for nombre, tierra in (("HERE · rápida", False), ("HERE · evita caminos de tierra", True)):
+        try:
+            alt = ruta_here(tuple(map(tuple, base["coords"])), base["perfil"], cajas, tierra)
+        except ErrorRuteo as e:
+            filas.append({"Variante": nombre, "Resultado": f"Sin ruta ({e})"})
+            continue
+        evita = not G.ruta_cruza(alt.coords, union)
+        fi = F.analizar([(alt.coords, {})], hab.coords, perfil)
+        coinc = G.coincidencia_desvio(alt.coords, alterna_ors, hab.coords) if alterna_ors else None
+        filas.append({
+            "Variante": nombre,
+            "Resultado": "Evita el bloqueo" if evita else "Pasa por el bloqueo",
+            "Habitual": fmt_min(hab.duracion_min), "Alterna": fmt_min(alt.duracion_min),
+            "Diferencia": f"+{fmt_min(alt.duracion_min - hab.duracion_min)}",
+            "Desvío": f"{fi['km_desvio']:.1f} km",
+            "Curvas críticas / invaden": f"{fi['curvas_criticas']} / {fi['curvas_invade']}",
+            "Coincide con alterna ORS": "—" if coinc is None else f"{coinc:.0%}",
+            "Avisos HERE": "; ".join(dict.fromkeys(alt.extras.get("avisos_here", []))) or "—"})
+        lineas.append({"nombre": nombre, "coords": alt.coords, "evita": evita})
+    return filas, lineas
+
+
+def filas_ors(base: dict) -> list:
+    filas = []
+    for c in base.get("candidatas") or []:
+        fi = c["ficha"]
+        filas.append({"Variante": f"ORS · {c['nombre']}", "Resultado": "Evita el bloqueo",
+                      "Habitual": fmt_min(base["t_orig"]), "Alterna": fmt_min(c["t_alt"]),
+                      "Diferencia": f"+{fmt_min(c['t_alt'] - base['t_orig'])}", "Desvío": f"{fi['km_desvio']:.1f} km",
+                      "Curvas críticas / invaden": f"{fi['curvas_criticas']} / {fi['curvas_invade']}",
+                      "Coincide con alterna ORS": "—", "Avisos HERE": "—"})
+    return filas
+
+
+def a_csv(filas: list, contexto: dict) -> str:
+    salida = io.StringIO()
+    columnas = list(contexto) + sorted({k for f in filas for k in f}, key=lambda k: list(filas[0]).index(k)
+                                       if k in filas[0] else 99)
+    w = csv.DictWriter(salida, fieldnames=columnas)
+    w.writeheader()
+    for f in filas:
+        w.writerow({**contexto, **f})
+    return salida.getvalue()
 
 
 @st.cache_resource
@@ -311,6 +396,9 @@ with col_mapa:
         if k != r.get("sel"):
             folium.PolyLine([(y, x) for x, y in c["alt"]], color="#8896A4", weight=4, dash_array="6 8",
                             tooltip=f"Alterna {c['nombre']}").add_to(m)
+    for lh in (r or {}).get("here_lineas") or []:
+        folium.PolyLine([(y, x) for x, y in lh["coords"]], color="#6B3FA0", weight=4, dash_array="2 8",
+                        tooltip=f"{lh['nombre']}" + ("" if lh["evita"] else " · pasa por el bloqueo")).add_to(m)
     for cv in ((r or {}).get("ficha") or {}).get("curvas", []):
         if cv["nivel"] != "ok":
             color = "#B42318" if cv["nivel"] == "critica" else "#D4A300"
@@ -583,3 +671,35 @@ with col_res:
                         "límite de peso, altura o ancho en el mapa.\n"
                         "- **Ninguna encuentra:** la vía falta o está desconectada en OpenStreetMap, o el radio "
                         "del bloqueo también cubre el cruce de la alterna. Reduce el radio y vuelve a calcular.")
+
+            # ---------- Prueba comparativa con HERE ----------
+            if "HERE_API_KEY" in st.secrets:
+                with st.expander("Prueba comparativa: ORS vs. HERE", expanded=bool(r.get("here_filas"))):
+                    usadas = contador_here()["n"] if contador_here()["fecha"] == datetime.now(TZ).date() else 0
+                    st.caption(f"Usa hasta 3 consultas de HERE: ruta habitual, alterna rápida y alterna que evita "
+                               f"caminos de tierra. Repetir el mismo escenario no consume más. "
+                               f"Consultas hoy: {usadas} de {limite_here()}.")
+                    if st.button("Comparar con HERE", width="stretch"):
+                        with st.spinner("Consultando HERE…"):
+                            filas_h, lineas_h = comparar_con_here(ss.resultado)
+                        ss.resultado["here_filas"], ss.resultado["here_lineas"] = filas_h, lineas_h
+                        st.rerun()
+                    if r.get("here_filas"):
+                        tabla = filas_ors(ss.resultado) + r["here_filas"]
+                        st.dataframe(tabla, hide_index=True, width="stretch")
+                        st.markdown(
+                            "- **Coincide con alterna ORS:** qué parte del desvío de HERE va por el mismo camino que "
+                            "la alterna ORS elegida. Alto = ambos motores coinciden; bajo = proponen caminos distintos "
+                            "y conviene revisar ambos.\n"
+                            "- Cada motor calcula sus propios tiempos; compara la **diferencia** de cada uno contra su "
+                            "propia ruta habitual.\n"
+                            "- En HERE, evitar una zona es una preferencia: si no hay otra forma, puede pasar por el "
+                            "bloqueo, y la tabla lo indica.\n"
+                            "- Las alternas de HERE se ven en el mapa en morado punteado.")
+                        contexto = {"fecha": datetime.now(TZ).strftime("%Y-%m-%d %H:%M"), "ruta": ss.ruta_sel,
+                                    "vehiculo": ss.resultado["perfil"],
+                                    "bloqueos": "; ".join(f"{b['lat']:.5f},{b['lon']:.5f}" for b in ss.bloqueos)}
+                        st.download_button("Descargar comparación (CSV)", a_csv(tabla, contexto),
+                                           file_name="comparacion_ors_here.csv", mime="text/csv", width="stretch")
+            else:
+                st.caption("Para la prueba comparativa con HERE, agrega HERE_API_KEY en los secretos.")
