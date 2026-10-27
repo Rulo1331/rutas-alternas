@@ -10,6 +10,7 @@ class PerfilVehiculo:
     ancho_m: float
     largo_m: float
     peso_t: float
+    ejes_m: tuple = ()      # distancias entre ejes efectivas (m) para estimar el barrido en curvas
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,7 @@ class Ruta:
     duracion_min: float
     distancia_km: float
     coords: list                     # [[lon, lat], ...]
+    extras: dict = field(default_factory=dict)   # superficie, tipo de vía, pendiente, categoría (ORS)
 
 
 @dataclass

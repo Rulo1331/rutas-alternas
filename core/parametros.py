@@ -3,11 +3,18 @@ Más adelante se leerán desde BigQuery; por ahora viven aquí para poder probar
 from .modelos import PerfilVehiculo, ParametrosCarga
 
 # Máximos legales por configuración (RNV, DS 058-2003-MTC). Reemplazar por datos reales por placa.
+# ejes_m: distancias efectivas entre ejes (PROVISIONALES, reemplazar con fichas técnicas):
+#   T3S3 = (eje delantero–tándem del tracto, quinta rueda–tándem del semirremolque); camión rígido = (batalla,)
 PERFILES = {
-    "granelero_t3s3": PerfilVehiculo("granelero_t3s3", "Granelero de alimento (T3S3)", 4.10, 2.60, 20.50, 48.0),
-    "jaulero_c3": PerfilVehiculo("jaulero_c3", "Jaulero pollo vivo (C3)", 4.10, 2.60, 12.30, 25.0),
-    "frigorifico_c2": PerfilVehiculo("frigorifico_c2", "Furgón frigorífico (C2)", 4.30, 2.60, 12.30, 18.0),
+    "granelero_t3s3": PerfilVehiculo("granelero_t3s3", "Granelero de alimento (T3S3)", 4.10, 2.60, 20.50, 48.0, (4.0, 11.0)),
+    "jaulero_c3": PerfilVehiculo("jaulero_c3", "Jaulero pollo vivo (C3)", 4.10, 2.60, 12.30, 25.0, (5.8,)),
+    "frigorifico_c2": PerfilVehiculo("frigorifico_c2", "Furgón frigorífico (C2)", 4.30, 2.60, 12.30, 18.0, (5.0,)),
 }
+
+# Ancho de calzada supuesto según superficie (PROVISIONAL: OpenStreetMap casi nunca trae el ancho real).
+# Pavimentada = dos carriles; sin pavimentar = se trata como un solo carril.
+ANCHO_CALZADA_M = {"pavimentada": 6.6, "sin_pavimentar": 4.5, "desconocida": 6.0}
+RADIO_CURVA_REVISAR_M = 50      # curvas con radio menor se analizan en la ficha
 
 CARGAS = {
     "pollo_vivo": ParametrosCarga("pollo_vivo", "Pollo vivo", 30, 240, 2.0, "jaulero_c3"),

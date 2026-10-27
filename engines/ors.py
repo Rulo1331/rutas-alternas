@@ -30,7 +30,8 @@ class MotorORS:
              perfil_ors: str = "driving-hgv") -> Ruta:
         """perfil_ors: "driving-hgv" (camión) o "driving-car" (auto). Las restricciones de
         dimensiones solo se envían con camión y si se pasa un perfil de vehículo."""
-        cuerpo = {"coordinates": coords, "instructions": False}
+        cuerpo = {"coordinates": coords, "instructions": False,
+                  "extra_info": ["surface", "waytype", "steepness", "waycategory"]}
         opciones = {}
         if perfil and perfil_ors == "driving-hgv":
             opciones["vehicle_type"] = "hgv"
@@ -44,9 +45,10 @@ class MotorORS:
         datos = self._post(f"/v2/directions/{perfil_ors}/geojson", cuerpo)
         f = datos["features"][0]
         resumen = f["properties"].get("summary", {})
+        extras = {k: v.get("values", []) for k, v in f["properties"].get("extras", {}).items()}
         return Ruta(duracion_min=resumen.get("duration", 0) / 60,
                     distancia_km=resumen.get("distance", 0) / 1000,
-                    coords=f["geometry"]["coordinates"])
+                    coords=f["geometry"]["coordinates"], extras=extras)
 
     def ajustar_a_via(self, lon: float, lat: float, radio_m: int = 350):
         """Pega el punto a la vía más cercana. Devuelve (lon, lat, nombre, distancia_m) o None."""

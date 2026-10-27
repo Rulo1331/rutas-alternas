@@ -11,6 +11,7 @@ from shapely.geometry import box, shape
 from shapely.ops import unary_union
 from streamlit_folium import st_folium
 
+from core import ficha as F
 from core import geometria as G
 from core import parametros as P
 from core import rios as R
@@ -78,21 +79,22 @@ def cargar_rutas() -> list:
 def alterna_por_ventanas(coords: tuple, orig: Ruta, en_ruta: list, poligonos: list, perfil_clave: str):
     """Calcula la alterna. Si la consulta completa supera el límite de la API (150 km en línea recta),
     la calcula solo en ventanas alrededor de los bloqueos y la une con la ruta habitual.
-    Devuelve (Ruta o None, mensaje de error, ventanas [(inicio, fin)], (extremos, evitar) para el diagnóstico)."""
+    Devuelve (Ruta o None, error, ventanas [(inicio, fin)], (extremos, evitar) para diagnóstico,
+    piezas [(coords, extras)] calculadas por el motor, para la ficha técnica)."""
     union = unary_union(poligonos)
     if V.distancia_recta_total(coords) <= V.LIMITE_KM:
         evitar = json.dumps(G.a_geojson(union))
         try:
             alt = calcular_ruta(coords, perfil_clave, evitar)
         except ErrorRuteo as e:
-            return None, str(e), [], (coords, evitar)
+            return None, str(e), [], (coords, evitar), []
         if G.ruta_cruza(alt.coords, union):
-            return None, "La única ruta que encontró el motor pasa por algún bloqueo.", [], (coords, evitar)
-        return alt, None, [], (coords, evitar)
+            return None, "La única ruta que encontró el motor pasa por algún bloqueo.", [], (coords, evitar), []
+        return alt, None, [], (coords, evitar), [(alt.coords, alt.extras)]
 
     acc = V.acumuladas_km(orig.coords)
     grupos = V.agrupar([b["frac"] * acc[-1] for b in en_ruta], orig.coords, acc)
-    tramos_geo, tramos_t, ventanas, diag = [], [], [], None
+    tramos_geo, tramos_t, ventanas, diag, piezas = [], [], [], None, []
     for (ini, fin), (km_min, km_max) in zip(grupos, V.limites_de_grupos(grupos, acc[-1])):
         limite = V.LIMITE_KM
         for intento in range(3):
@@ -112,17 +114,49 @@ def alterna_por_ventanas(coords: tuple, orig: Ruta, en_ruta: list, poligonos: li
                     limite *= 0.8          # ORS estimó la distancia distinto: se achica la ventana y se reintenta
                     continue
                 return (None, f"Sin alterna dentro de la ventana de {V.distancia_km(*extremos):.0f} km "
-                              f"alrededor del bloqueo. {e}", ventanas, diag)
+                              f"alrededor del bloqueo. {e}", ventanas, diag, piezas)
         if G.ruta_cruza(alt.coords, locales):
-            return None, "La única ruta que encontró el motor pasa por algún bloqueo.", ventanas, diag
+            return None, "La única ruta que encontró el motor pasa por algún bloqueo.", ventanas, diag, piezas
         ventanas.append(extremos)
+        piezas.append((alt.coords, alt.extras))
         tramos_geo.append((i, j, alt.coords))
         tramos_t.append((i, j, alt.duracion_min, alt.distancia_km))
     coords_alt = V.empalmar(orig.coords, tramos_geo)
     if G.ruta_cruza(coords_alt, union):
-        return None, "La alterna resultante pasa por otro bloqueo.", ventanas, diag
+        return None, "La alterna resultante pasa por otro bloqueo.", ventanas, diag, piezas
     t, d = V.tiempos_empalmados(orig.duracion_min, orig.distancia_km, acc, tramos_t)
-    return Ruta(t, d, coords_alt), None, ventanas, diag
+    return Ruta(t, d, coords_alt), None, ventanas, diag, piezas
+
+
+def generar_candidatas(coords, orig, en_ruta, poligonos, perfil_clave):
+    """Alterna A (la más rápida) y, si tiene tramos sin pavimentar, alterna B que los evita cortándolos
+    con zonas pequeñas (hasta 2 rondas). Devuelve (candidatas, error, diagnóstico)."""
+    perfil = P.PERFILES[perfil_clave]
+    alt, error, ventanas, diag, piezas = alterna_por_ventanas(coords, orig, en_ruta, poligonos, perfil_clave)
+    if not alt:
+        return [], error, diag
+    ficha = F.analizar(piezas, orig.coords, perfil)
+    candidatas = [{"nombre": "A · Más rápida", "ruta": alt, "ficha": ficha, "ventanas": ventanas}]
+    cortes = []
+    for _ronda in range(2):
+        nuevos = F.cortes_sin_pavimentar(ficha)
+        if not nuevos:
+            break
+        cortes += [G.poligono_bloqueo(lon, lat, 60) for lon, lat in nuevos]
+        alt_b, _, ventanas_b, _, piezas_b = alterna_por_ventanas(coords, orig, en_ruta, poligonos + cortes, perfil_clave)
+        if not alt_b:
+            break
+        ficha = F.analizar(piezas_b, orig.coords, perfil)
+        if ficha["km_sin_pavimentar"] < candidatas[-1]["ficha"]["km_sin_pavimentar"] - 0.5:
+            candidata = {"nombre": "B · Prioriza vía pavimentada", "ruta": alt_b, "ficha": ficha, "ventanas": ventanas_b}
+            candidatas = candidatas[:1] + [candidata]
+        if ficha["km_sin_pavimentar"] < 0.5:
+            break
+    t_rapida = min(c["ruta"].duracion_min for c in candidatas)
+    for c in candidatas:
+        c["pros"], c["contras"] = F.pros_contras(c["ficha"], c["ruta"].duracion_min, t_rapida,
+                                                c["ruta"].distancia_km - orig.distancia_km)
+    return candidatas, None, diag
 
 
 def redondear(p):
@@ -191,7 +225,7 @@ with st.sidebar:
                          on_change=invalidar)
     radio = st.slider("Radio del bloqueo (m)", 50, 500, P.RADIO_BLOQUEO_M, 25, on_change=invalidar)
     mostrar_todos = st.checkbox("Mostrar todos los ríos monitoreados", value=False)
-    if st.button("Limpiar bloqueos", use_container_width=True):
+    if st.button("Limpiar bloqueos", width="stretch"):
         ss.bloqueos = []
         invalidar()
         st.rerun()
@@ -228,7 +262,17 @@ except Exception as e:  # la app sigue funcionando aunque BigQuery falle
     estados, aviso_hidro = None, f"No se pudo leer la hidrología ({e.__class__.__name__}). Ríos sin estado."
 estados = estados or {}
 
-r = ss.resultado
+def vista_resultado():
+    """Resultado con la alterna elegida volcada en los campos que usan el mapa y el panel."""
+    res = ss.resultado
+    if res and res.get("en_ruta"):
+        cands = res.get("candidatas") or []
+        sel = min(ss.get("cand_sel", 0), len(cands) - 1) if cands else None
+        res = dict(res, **(cands[sel] if cands else {"rec": res["rec_sin_alterna"]}), sel=sel)
+    return res
+
+
+r = vista_resultado()
 linea_habitual = r["orig"] if r else (vista_previa.coords if vista_previa else None)
 cruces_orig = R.cruces(linea_habitual, rios) if linea_habitual else []
 cruces_alt = R.cruces(r["alt"], rios) if r and r.get("alt") else []
@@ -263,6 +307,17 @@ with col_mapa:
     if linea_habitual:
         folium.PolyLine([(y, x) for x, y in linea_habitual], color="#1D5FB8", weight=6,
                         tooltip="Ruta habitual").add_to(m)
+    for k, c in enumerate((r or {}).get("candidatas") or []):
+        if k != r.get("sel"):
+            folium.PolyLine([(y, x) for x, y in c["alt"]], color="#8896A4", weight=4, dash_array="6 8",
+                            tooltip=f"Alterna {c['nombre']}").add_to(m)
+    for cv in ((r or {}).get("ficha") or {}).get("curvas", []):
+        if cv["nivel"] != "ok":
+            color = "#B42318" if cv["nivel"] == "critica" else "#D4A300"
+            texto = "no pasa sin maniobra" if cv["nivel"] == "critica" else "invade carril contrario"
+            folium.RegularPolygonMarker((cv["lat"], cv["lon"]), number_of_sides=3, radius=7, color="#FFFFFF",
+                                        weight=1, fill=True, fill_color=color, fill_opacity=1,
+                                        tooltip=f"Curva de radio ~{cv['radio_m']:.0f} m: {texto}").add_to(m)
     if r and r.get("alt"):
         folium.PolyLine([(y, x) for x, y in r["alt"]], color="#C2570C", weight=5, dash_array="10 8",
                         tooltip="Alterna").add_to(m)
@@ -339,7 +394,7 @@ with col_res:
             if nuevo != b["reap"]:
                 b["reap"] = nuevo
                 invalidar()
-            if c2.button("Quitar", key=f"quitar_{b['id']}", use_container_width=True):
+            if c2.button("Quitar", key=f"quitar_{b['id']}", width="stretch"):
                 ss.bloqueos = [x for x in ss.bloqueos if x["id"] != b["id"]]
                 invalidar()
                 st.rerun()
@@ -351,7 +406,7 @@ with col_res:
     if faltan:
         st.info("Falta: " + ", ".join(faltan) + ". Elige una ruta en la barra lateral o marca en el mapa.")
 
-    if st.button("Calcular", type="primary", disabled=bool(faltan), use_container_width=True):
+    if st.button("Calcular", type="primary", disabled=bool(faltan), width="stretch"):
         coords = coords_ruta()
         with st.spinner("Calculando rutas…"):
             try:
@@ -384,24 +439,32 @@ with col_res:
             ss.diagnostico = None
 
             if en_ruta:
-                alt, error, ventanas, diag = alterna_por_ventanas(coords, orig, en_ruta, poligonos, perfil_clave)
-                res.update(ventanas=ventanas, diag_coords=diag[0], diag_evitar=diag[1])
+                candidatas, error, diag = generar_candidatas(coords, orig, en_ruta, poligonos, perfil_clave)
+                res.update(diag_coords=diag[0], diag_evitar=diag[1], t_hasta=min(b["t_hasta"] for b in en_ruta))
                 if error:
                     res["error_alt"] = error
                 bloqueos_t = [(b["t_hasta"], reapertura_en_min(b["reap"])) for b in en_ruta]
-                res["rec"] = recomendar_varios(orig.duracion_min, alt.duracion_min if alt else None,
-                                               bloqueos_t, carga, hora.hour)
-                res["t_hasta"] = min(b["t_hasta"] for b in en_ruta)
-                if alt:
+                res["rec_sin_alterna"] = recomendar_varios(orig.duracion_min, None, bloqueos_t, carga, hora.hour)
+                res["candidatas"] = []
+                for c in candidatas:
+                    alt = c["ruta"]
                     div = G.punto_divergencia(orig.coords, alt.coords)
-                    res.update(alt=alt.coords, t_alt=alt.duracion_min, d_alt=alt.distancia_km, divergencia=div,
-                               km_decision=div[2] * orig.distancia_km if div else None,
-                               enlace=G.enlace_google_maps(coords[0], coords[-1],
-                                                           G.puntos_exclusivos(alt.coords, orig.coords)))
+                    res["candidatas"].append({
+                        "nombre": c["nombre"], "alt": alt.coords, "t_alt": alt.duracion_min, "d_alt": alt.distancia_km,
+                        "ficha": c["ficha"], "pros": c["pros"], "contras": c["contras"], "ventanas": c["ventanas"],
+                        "rec": recomendar_varios(orig.duracion_min, alt.duracion_min, bloqueos_t, carga, hora.hour),
+                        "divergencia": div, "km_decision": div[2] * orig.distancia_km if div else None,
+                        "enlace": G.enlace_google_maps(coords[0], coords[-1], G.puntos_exclusivos(alt.coords, orig.coords)),
+                        "gpx": F.a_gpx(c["nombre"], alt.coords)})
+                if res["candidatas"]:
+                    res["sugerida"] = min(range(len(res["candidatas"])),
+                                          key=lambda k: F.clave_orden(res["candidatas"][k]["ficha"],
+                                                                      res["candidatas"][k]["t_alt"]))
+                    ss.cand_sel = res["sugerida"]
             ss.resultado = res
         st.rerun()
 
-    r = ss.resultado
+    r = vista_resultado()
     if r:
         for b in r["fuera"]:
             st.caption(f"Bloqueo {b['n']}: no está sobre la ruta habitual.")
@@ -409,6 +472,17 @@ with col_res:
             st.success("Ningún bloqueo está sobre la ruta habitual: el camión puede continuar normalmente.")
             st.caption(f"Ruta habitual: {fmt_min(r['t_orig'])} · {r['d_orig']:.1f} km")
         else:
+            cands = r.get("candidatas") or []
+            if len(cands) > 1:
+                etiquetas = [f"{c['nombre']} · {fmt_min(c['t_alt'])} · {c['ficha']['km_sin_pavimentar']:.0f} km sin pavimentar"
+                             + (" · sugerida" if k == r.get("sugerida") else "") for k, c in enumerate(cands)]
+                elegida = st.radio("Alterna a evaluar", range(len(cands)), index=r["sel"],
+                                   format_func=lambda k: etiquetas[k])
+                if elegida != r["sel"]:
+                    ss.cand_sel = elegida
+                    st.rerun()
+                st.caption("Se sugiere la alterna sin curvas críticas y con menos tramos sin pavimentar; "
+                           "a igualdad, la más rápida. La decisión final es del encargado.")
             rec = r["rec"]
             st.markdown(f"<div style='background:{COLORES[rec.accion]};color:#fff;padding:14px 16px;"
                         f"border-radius:10px;font-size:1.4rem;font-weight:700'>{rec.titulo}</div>",
@@ -443,6 +517,30 @@ with col_res:
                         st.warning(f"La ruta {titulo} cruza el río {c['rio']} en "
                                    f"{R.ETIQUETAS[nivel_de(c['clave'])].lower()}. "
                                    + detalle_de(c["clave"]).replace("<br>", " · "))
+            if r.get("ficha"):
+                fi = r["ficha"]
+                st.markdown("**Validación:** Nivel 4 · sin validar en campo (calculada por el motor).")
+                with st.expander("Ficha técnica del desvío", expanded=True):
+                    for p in r["pros"]:
+                        st.markdown(f"✅ {p}")
+                    for c in r["contras"]:
+                        st.markdown(f"⚠️ {c}")
+                    st.dataframe([
+                        {"Dato": "Longitud del desvío", "Valor": f"{fi['km_desvio']:.1f} km"},
+                        {"Dato": "Pavimentado", "Valor": f"{fi['km_pavimentada']:.1f} km"},
+                        {"Dato": "Sin pavimentar", "Valor": f"{fi['km_sin_pavimentar']:.1f} km (trocha: {fi['km_trocha']:.1f} km)"},
+                        {"Dato": "Sin dato de superficie", "Valor": f"{fi['km_desconocida']:.1f} km"},
+                        {"Dato": "Pendiente ≥ 7 % / ≥ 12 %", "Valor": f"{fi['km_pendiente_7']:.1f} km / {fi['km_pendiente_12']:.1f} km"},
+                        {"Dato": "Curvas que no pasa sin maniobra", "Valor": str(fi["curvas_criticas"])},
+                        {"Dato": "Curvas que invaden carril contrario", "Valor": str(fi["curvas_invade"])},
+                        {"Dato": "Vados / túneles", "Valor": f"{fi['vados']} / {fi['tuneles']}"},
+                    ], hide_index=True, width="stretch")
+                    st.caption("Datos de OpenStreetMap y estimaciones a partir del trazado; el ancho de vía y las "
+                               "distancias entre ejes son valores provisionales. Sirve para decidir qué inspeccionar, "
+                               "no reemplaza la inspección.")
+                    st.download_button("Descargar GPX para la inspección", r["gpx"],
+                                       file_name=f"alterna_{r['nombre'].split(' ')[0]}.gpx",
+                                       mime="application/gpx+xml", width="stretch")
             if r.get("ventanas"):
                 n = len(r["ventanas"])
                 st.caption(f"La alterna se calculó en {n} {'ventana' if n == 1 else 'ventanas'} alrededor de los "
@@ -450,14 +548,14 @@ with col_res:
             if r.get("error_alt"):
                 st.caption(f"Detalle del motor: {r['error_alt']}")
             if r.get("enlace"):
-                st.link_button("Abrir alterna en Google Maps", r["enlace"], use_container_width=True)
+                st.link_button("Abrir alterna en Google Maps", r["enlace"], width="stretch")
                 st.caption("Google recalcula entre puntos intermedios; verifica que siga la alterna.")
 
             # ---------- Diagnóstico ----------
             with st.expander("Diagnóstico: comparar variantes de la alterna"):
                 st.caption("Calcula la alterna con tres variantes para saber por qué no aparece "
                            "(en la primera ventana, si la ruta es larga). Usa hasta 3 consultas de la cuota diaria.")
-                if st.button("Ejecutar diagnóstico", use_container_width=True):
+                if st.button("Ejecutar diagnóstico", width="stretch"):
                     evitar_json = r["diag_evitar"]
                     poly = shape(json.loads(evitar_json))
                     filas = []
@@ -477,7 +575,7 @@ with col_res:
                                           "Tiempo": "—", "Distancia": "—"})
                     ss.diagnostico = filas
                 if ss.get("diagnostico"):
-                    st.dataframe(ss.diagnostico, hide_index=True, use_container_width=True)
+                    st.dataframe(ss.diagnostico, hide_index=True, width="stretch")
                     st.markdown(
                         "- **Solo el auto encuentra alterna:** el camino existe, pero el mapa lo marca como no apto "
                         "para camión o es una trocha. Confirmar con los choferes si de verdad pasa un camión.\n"

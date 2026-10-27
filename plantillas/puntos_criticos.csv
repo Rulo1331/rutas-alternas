@@ -1,0 +1,2 @@
+id,nombre,referencia,lat,lon,tipo_evento,frecuencia,eventos_10_anios,duracion_tipica_h,meses_riesgo,ultimo_evento,fuente,rio_quebrada,alterna_conocida,alterna_apta,alterna_apta_para,observaciones,activo,actualizado
+PC-000,EJEMPLO (borrar esta fila),km 000 Panamericana Norte,-8.00000,-79.00000,huaico,media,3,12,"ene,feb,mar",2023-03-10,choferes,Quebrada X,"Desvío por la vía a Y hasta Z",no_se,,Texto libre,true,2026-10-27 00:00:00
